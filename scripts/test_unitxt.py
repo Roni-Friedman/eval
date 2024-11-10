@@ -1,5 +1,5 @@
 # First Party
-from instructlab.eval.unitxt import UnitxtEvaluator
+from instructlab.eval.unitxt import UnitxtEvaluator, UnitxtFileEvaluator
 
 
 def test_unitxt():
@@ -20,5 +20,18 @@ def test_unitxt():
     return True
 
 
+def test_unitxt_from_user_file():
+    model_path = "instructlab/granite-7b-lab"
+    file = "scripts/testdata/unitxt/sample_data.csv"
+    task = "qa"
+    unitxt = UnitxtFileEvaluator(model_path=model_path, file_path=file, task_type=task)
+    overall_score, single_scores = unitxt.run()
+    print(f"Overall scores: {overall_score}")
+    # test with/without gt_output
+    # test different task types
+    # test llmaaj
+    # test bad file?
+
+
 if __name__ == "__main__":
-    assert test_unitxt() == True
+    test_unitxt_from_user_file()
