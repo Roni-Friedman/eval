@@ -24,9 +24,12 @@ def test_unitxt_from_user_file():
     model_path = "instructlab/granite-7b-lab"
     file = "scripts/testdata/unitxt/sample_data.csv"
     task = "qa"
-    unitxt = UnitxtFileEvaluator(model_path=model_path, file_path=file, task_type=task)
+    unitxt = UnitxtFileEvaluator(
+        model_path=model_path, file_path=file, task_type=task, batchsize=4
+    )
     overall_score, single_scores = unitxt.run()
     print(f"Overall scores: {overall_score}")
+    print(f"single scores: {single_scores}")
     # test with/without gt_output
     # test different task types
     # test llmaaj

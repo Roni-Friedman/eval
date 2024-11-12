@@ -5,12 +5,13 @@ https://arxiv.org/abs/2401.14019
 """
 
 # Standard
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
-from uuid import uuid4
 import json
 import os
+import secrets
 import shutil
+import string
 
 # Third Party
 from lm_eval.tasks.unitxt import task
@@ -33,15 +34,20 @@ INSTRUCTION = "instruction"
 
 
 @dataclass
-class RenameStep:
-    origin_field: str
-    target_field: str
+class ProcessStep:
+    __type__: str
+    field: str
+    to_field: str
+    key: str = None
+    val: str = None
 
     def to_dict(self):
-        return {
-            "__type__": "rename",
-            "field_to_field": {self.origin_field: self.target_field},
-        }
+        data = asdict(self)
+        data.pop("key")
+        data.pop("val")
+        if self.key is not None:
+            data[self.key] = self.val
+        return data
 
 
 class TaskType(Enum):
@@ -84,7 +90,9 @@ class UserUnitxtCardData:
     def __post_init__(self):
         self.num_demos = 0
         self.metric = self._set_metric()
-        self.input_fields, self.pre_process_steps = self._set_fields()
+        self.input_fields, self.reference_field, self.pre_process_steps = (
+            self._set_fields()
+        )
         self.templates = self._set_templates()
 
     def _set_metric(self) -> str:
@@ -92,7 +100,7 @@ class UserUnitxtCardData:
         match self.task_type:
             case TaskType.QA:
                 # TODO chage to generic metric
-                metric = "metrics.llm_as_judge.rating.mistral_7b_instruct_v0_2_huggingface_template_mt_bench_single_turn"
+                metric = "metrics.llm_as_judge.rating.llama_3_70b_instruct_ibm_genai_template_generic_single_turn"
                 # TODO return when metric is available:
                 # if GT_OUTPUT in self.file_columns:
                 #     metric = f"{metric}_with_reference"
@@ -103,17 +111,22 @@ class UserUnitxtCardData:
     def _set_fields(self):
         available_columns = self.file_columns
         input_fields = {INSTRUCTION: "str"}
+        reference_field = ""
         pre_process_steps = []
         match self.task_type:
             case TaskType.QA:
-                if "gt_output" in available_columns:
-                    pre_process_steps.append(RenameStep("gt_output", "answer"))
-                    input_fields["answer"] = "str"
-                pre_process_steps.append(RenameStep("input", "question"))
+                if GT_OUTPUT in available_columns:
+                    pre_process_steps.append(
+                        ProcessStep("rename", GT_OUTPUT, "answers").to_dict()
+                    )
+                    reference_field = "answers"
+                pre_process_steps.append(
+                    ProcessStep("rename", "input", "question").to_dict()
+                )
                 input_fields["question"] = "str"
             case _:
                 pass
-        return input_fields, pre_process_steps
+        return input_fields, reference_field, pre_process_steps
 
     def _set_templates(self):
         templates = []
@@ -135,20 +148,32 @@ class UnitxtEvaluator(MMLUBranchEvaluator):
         unitxt_recipe   unitxt recipe (see unitxt.ai for more information)
                         A Recipe holds a complete specification of a unitxt pipeline
                         Example: card=cards.wnli,template=templates.classification.multi_class.relation.default,max_train_instances=5,loader_limit=20,num_demos=3,demos_pool_size=10
-
+        output_dir      The directory to use for evaluation output, 'eval_output' by default
+        batchsize       "auto" by default
     """
 
     name = "unitxt"
 
-    def __init__(self, model_path, unitxt_recipe: str, output_dir: str = "eval_output"):
+    def __init__(
+        self,
+        model_path,
+        unitxt_recipe: str,
+        output_dir: str = "eval_output",
+        batchsize="auto",
+    ):
         unitxt_task, tasks_dir = self._assign_task_name_and_dir(output_dir)
         super().__init__(
-            model_path=model_path, tasks_dir=tasks_dir, tasks=[unitxt_task], few_shots=0
+            model_path=model_path,
+            tasks_dir=tasks_dir,
+            tasks=[unitxt_task],
+            few_shots=0,
+            batch_size=batchsize,
         )
         self.unitxt_recipe = unitxt_recipe
 
     def _assign_task_name_and_dir(self, output_dir) -> tuple:
-        task_name = str(uuid4())
+        alphabet = string.ascii_letters + string.digits
+        task_name = "".join(secrets.choice(alphabet) for _ in range(8))
         task_dir = os.path.join(output_dir, f"{TEMP_DIR_PREFIX}_{task_name}")
         return task_name, task_dir
 
@@ -174,7 +199,9 @@ class UnitxtEvaluator(MMLUBranchEvaluator):
                 TEMP_DIR_PREFIX,
             )
 
-    def run(self, server_url: str | None = None) -> tuple:
+    def run(
+        self, server_url: str | None = None, keep_config_files: bool = False
+    ) -> tuple:
         """
         Runs evaluation
 
@@ -203,7 +230,7 @@ class UnitxtEvaluator(MMLUBranchEvaluator):
                 for i, instance in enumerate(instances):
                     scores = {}
                     for metric in metrics:
-                        scores[metric] = instance[metric][0]
+                        scores[metric] = instance[metric]
                     instance_scores[i] = scores
             except KeyError as e:
                 logger.error("Error in extracting single instance scores")
@@ -211,7 +238,10 @@ class UnitxtEvaluator(MMLUBranchEvaluator):
                 logger.error(e.__traceback__)
                 instance_scores = None
         finally:
-            self._remove_temp_unitxt_files()
+            if keep_config_files:  # For debugging mostly
+                pass
+            else:
+                self._remove_temp_unitxt_files()
         return global_scores, instance_scores
 
 
@@ -254,43 +284,37 @@ class UnitxtFileEvaluator(UnitxtEvaluator):
         task_type: str,
         use_llmaaj: bool = None,
         output_dir: str = "eval_output",
+        batchsize="auto",
     ):
         self.task_type = TaskType.from_string(task_type)
         self.file_path, file_columns = self._validate_file(file_path)
         self.user_card_data = UserUnitxtCardData(
             task_type=self.task_type, use_llmaaj=use_llmaaj, file_columns=file_columns
         )
-        user_task = self._create_user_unitxt_card(output_dir)
-        unitxt_recipe = self.get_recipe(user_task)
-        # possibly inherit from mmlubranch and provide task dir and task name
+        user_recipe, recipe_data = self._create_user_unitxt_card()
         super().__init__(
-            model_path=model_path, unitxt_recipe=unitxt_recipe, output_dir=output_dir
+            model_path=model_path,
+            unitxt_recipe=user_recipe,
+            output_dir=output_dir,
+            batchsize=batchsize,
         )
+        self._write_card_data(
+            user_recipe, recipe_data
+        )  # can be written only after task dir is set in super().__init__
 
-    def get_recipe(self, user_task):
-        return f"card={user_task}"
-
-    def _create_user_unitxt_card(self, output_dir):
-        user_task, user_task_dir = self._assign_task_name_and_dir(output_dir)
-        os.makedirs(name=user_task_dir, exist_ok=True)
-        os.environ["UNITXT_ARTIFACTORIES"] = user_task_dir
-        card_file = os.path.join(user_task_dir, f"{user_task}.json")
-        num_demos = 0  # TODO parameter? multiple options?
+    def _create_user_unitxt_card(self):
+        user_task, _ = self._assign_task_name_and_dir()
         data = {
             "__type__": "standard_recipe",
-            "demos_pool_size": 20,  # TODO what should be the value here?
-            "num_demos": num_demos,
-            "demos_taken_from": "test",
-            "max_train_instances": 1000,  # TODO what should be the value here?
-            "max_validation_instances": 1000,  # TODO what should be the value here?
-            "max_test_instances": 100,  # TODO what should be the value here?
             "card": {
+                "__type__": "task_card",
                 "loader": {"__type__": "load_csv", "files": {"test": self.file_path}},
+                "preprocess_steps": self.user_card_data.pre_process_steps,
                 "task": {
                     "__type__": "task",
                     "input_fields": self.user_card_data.input_fields,
                     "reference_fields": {
-                        "gt_output": "str"  # TODO should it be here regardless if it is available?
+                        "answers": "str"  # TODO value should come from dataclass data
                     },
                     "metrics": [self.user_card_data.metric],
                     "prediction_type": "str",
@@ -298,13 +322,15 @@ class UnitxtFileEvaluator(UnitxtEvaluator):
             },
             "template": self.user_card_data.templates,
         }
-        with open(card_file, "w") as f:
-            jsoned_data = json.dumps(data, indent=4)
-            f.write(jsoned_data)
-            f.write("\n")
+        return user_task, data
 
+    def _write_card_data(self, user_task, data):
+        os.makedirs(name=self.tasks_dir, exist_ok=True)
+        os.environ["UNITXT_ARTIFACTORIES"] = self.tasks_dir
+        card_file = os.path.join(self.tasks_dir, f"{user_task}.json")
+        with open(card_file, "w") as f:
+            json.dump(data, f, indent=4)
         logger.debug("user unitxt card written to %s", card_file)
-        return user_task
 
     def _validate_file(self, file_path):
         if not os.path.isfile(file_path):
